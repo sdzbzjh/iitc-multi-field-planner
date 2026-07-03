@@ -325,13 +325,25 @@ function createSelectionStore() {
 }
 
 function portalFromIitc(guid, data = {}) {
-  const latLng = data.latLng ?? data._latlng ?? {};
-  const options = data.options?.data ?? data.options ?? data;
+  return resolveIitcPortal(guid, data);
+}
+
+function resolveIitcPortal(guid, data = {}, windowRef = undefined) {
+  const marker = data.portal ?? data.marker ?? windowRef?.portals?.[guid];
+  const details = data.portalDetails ?? data.details ?? {};
+  const markerData = marker?.options?.data ?? marker?.options ?? data.options?.data ?? data.options ?? {};
+  const latLng = data.latLng ?? marker?.getLatLng?.() ?? marker?._latlng ?? {};
+  const lngLat = details.locationE6
+    ? {
+        lat: details.locationE6.latE6 / 1e6,
+        lng: details.locationE6.lngE6 / 1e6
+      }
+    : {};
   return normalizePortal({
     id: guid,
-    name: options.title ?? options.name ?? guid,
-    lat: latLng.lat ?? options.lat,
-    lng: latLng.lng ?? options.lng
+    name: details.title ?? markerData.title ?? markerData.name ?? data.title ?? data.name ?? guid,
+    lat: latLng.lat ?? lngLat.lat ?? markerData.lat ?? data.lat,
+    lng: latLng.lng ?? lngLat.lng ?? markerData.lng ?? data.lng
   });
 }
 
@@ -518,6 +530,7 @@ function createPlannerPlugin(windowRef = globalThis.window) {
     });
 
     mountPanel(windowRef, panel.root);
+    installPortalDetailsButton(windowRef, plugin);
     renderSelection();
   };
 
@@ -528,7 +541,7 @@ function createPlannerPlugin(windowRef = globalThis.window) {
   };
 
   plugin.addIitcPortal = function addIitcPortal(guid, data) {
-    plugin.addPortal(portalFromIitc(guid, data));
+    plugin.addPortal(resolveIitcPortal(guid, data, windowRef));
   };
 
   plugin.getSelection = function getSelection() {
@@ -568,6 +581,40 @@ function createPlannerPlugin(windowRef = globalThis.window) {
 function mountPanel(windowRef, root) {
   const toolbox = windowRef.document.querySelector('#toolbox') ?? windowRef.document.body;
   toolbox.append(root);
+}
+
+function installPortalDetailsButton(windowRef, plugin) {
+  if (plugin.portalDetailsButtonInstalled) {
+    return;
+  }
+  plugin.portalDetailsButtonInstalled = true;
+
+  const renderButton = (data = {}) => {
+    const guid = data.guid ?? data.portalGuid ?? windowRef.selectedPortal;
+    const container = windowRef.document.querySelector('#portaldetails') ?? windowRef.document.querySelector('.portal_details');
+    if (!guid || !container || container.querySelector('[data-iitc-mfp-add]')) {
+      return;
+    }
+
+    const button = windowRef.document.createElement('button');
+    button.type = 'button';
+    button.textContent = 'Add to multi-field plan';
+    button.setAttribute('data-iitc-mfp-add', guid);
+    button.addEventListener('click', () => {
+      plugin.addIitcPortal(guid, data);
+      button.textContent = 'Added to multi-field plan';
+      button.disabled = true;
+    });
+    container.append(button);
+  };
+
+  if (typeof windowRef.addHook === 'function') {
+    windowRef.addHook('portalDetailsUpdated', renderButton);
+  }
+
+  windowRef.document.addEventListener('click', () => {
+    windowRef.setTimeout?.(() => renderButton({ guid: windowRef.selectedPortal }), 0);
+  });
 }
 
 
