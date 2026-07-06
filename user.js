@@ -202,53 +202,660 @@ function stablePlanSignature(plan) {
 }
 
 
+// src/planner/upstreamPlanner.js
+
+const INF = Number.POSITIVE_INFINITY;
+
+class UpstreamPoint {
+  constructor(portal) {
+    this.portal = portal;
+    this.id = portal.id;
+    this.x = portal.lng;
+    this.y = portal.lat;
+  }
+}
+
+class Link {
+  constructor(origin, target, options = {}) {
+    this.origin = options.reverse ? target : origin;
+    this.target = options.reverse ? origin : target;
+    this.jetLink = Boolean(options.jetLink);
+    this.triangle = options.triangle ?? null;
+  }
+}
+
+class PointSet {
+  constructor(points) {
+    this.pointList = [...points];
+    this.needUpdate = true;
+    this.innerPoints = [];
+  }
+
+  get norm() {
+    return this.pointList.length;
+  }
+
+  get convexHull() {
+    if (!this.needUpdate) {
+      return this._convexHull;
+    }
+
+    this.pointList.sort(comparePoints);
+    const lowerHull = [];
+    for (const point of this.pointList) {
+      while (lowerHull.length >= 2 && crossProduct(lowerHull.at(-2), lowerHull.at(-1), point) <= 0) {
+        lowerHull.pop();
+      }
+      lowerHull.push(point);
+    }
+
+    const upperHull = [];
+    for (const point of this.pointList) {
+      while (upperHull.length >= 2 && crossProduct(upperHull.at(-2), upperHull.at(-1), point) >= 0) {
+        upperHull.pop();
+      }
+      upperHull.push(point);
+    }
+    upperHull.shift();
+    upperHull.pop();
+    upperHull.reverse();
+
+    this._convexHull = new ConvexHull([...lowerHull, ...upperHull]);
+    this.needUpdate = false;
+    this.innerPoints = [...this.pointList];
+    for (const point of this._convexHull.pointList) {
+      removePoint(this.innerPoints, point);
+    }
+    return this._convexHull;
+  }
+
+  cover(point) {
+    const hull = this.convexHull;
+    for (let i = 1; i < hull.norm; i += 1) {
+      if (crossProduct(point, hull.pointList[i - 1], hull.pointList[i]) <= 0) {
+        return false;
+      }
+    }
+    return crossProduct(point, hull.pointList.at(-1), hull.pointList[0]) > 0;
+  }
+
+  divide(partition) {
+    const newPartition = [];
+    for (const item of partition) {
+      const triangle = item instanceof Triangle ? item : new Triangle(item.pointList);
+      for (const point of this.innerPoints) {
+        triangle.addInnerPoints(point);
+      }
+      newPartition.push(triangle);
+    }
+    return newPartition;
+  }
+
+  findBalanceKeySolution() {
+    const partitions = this.convexHull.triangulation().map((partition) => this.divide(partition));
+    let solution = null;
+
+    for (const partition of partitions) {
+      const triangleResultMap = new Map();
+      for (const triangle of partition) {
+        if (!getTriangleMap(triangleResultMap, triangle)) {
+          let outerLinksSet = null;
+          let initOut = new Map();
+          let initIn = new Map();
+          for (const [tri, result] of triangleResultMap.entries()) {
+            if (tri.isNeighbour(triangle)) {
+              const labels = new Map([[tri.A, 'A'], [tri.B, 'B'], [tri.C, 'C']]);
+              const commonEdge = tri.commonEdge(triangle);
+              const directedEdge = result.links.find((link) => sameUndirectedLink(link, commonEdge));
+              if (directedEdge) {
+                outerLinksSet = genOuterLinksSet(triangle.getOuterIndex(directedEdge), directedEdge, triangle);
+                initOut = new Map([[directedEdge.origin, Math.max(0, result[`outDegree${labels.get(directedEdge.origin)}`] - 1)]]);
+                initIn = new Map([[directedEdge.target, Math.max(0, result[`inDegree${labels.get(directedEdge.target)}`] - 1)]]);
+              }
+              break;
+            }
+          }
+          triangleResultMap.set(triangle, triangle.findBalanceKeySolution({ outerLinksSet, initOut, initIn }));
+        }
+      }
+
+      const triangleResults = [...triangleResultMap.values()];
+      const innerMaxKey = Math.max(...triangleResults.map((value) => value.key));
+      const outerMaxKey = new Map(this.convexHull.pointList.map((point) => [point, 0]));
+      const outerOutDegree = new Map(this.convexHull.pointList.map((point) => [point, 0]));
+      const tmpLinks = [];
+
+      for (const [triangle, result] of triangleResultMap.entries()) {
+        tmpLinks.push(...result.links);
+        addMap(outerMaxKey, triangle.A, result.inDegreeA);
+        addMap(outerMaxKey, triangle.B, result.inDegreeB);
+        addMap(outerMaxKey, triangle.C, result.inDegreeC);
+        addMap(outerOutDegree, triangle.A, result.outDegreeA);
+        addMap(outerOutDegree, triangle.B, result.outDegreeB);
+        addMap(outerOutDegree, triangle.C, result.outDegreeC);
+
+        for (const link of result.links) {
+          if ([triangle.A, triangle.B, triangle.C].includes(link.origin)
+            && [triangle.A, triangle.B, triangle.C].includes(link.target)) {
+            const i1 = this.convexHull.pointList.indexOf(link.origin);
+            const i2 = this.convexHull.pointList.indexOf(link.target);
+            const isBoundary = Math.abs(i1 - i2) === 1 || Math.abs(i1 - i2) === this.convexHull.norm - 1;
+            if (!isBoundary) {
+              addMap(outerMaxKey, link.target, -0.5);
+              addMap(outerOutDegree, link.origin, -0.5);
+            }
+          }
+        }
+      }
+
+      let maxKey = Math.max(innerMaxKey, ...outerMaxKey.values());
+      const maxOutDegree = Math.max(...outerOutDegree.values());
+      const links = uniqueLinks(tmpLinks);
+      if (maxOutDegree > 8) {
+        maxKey = INF;
+      }
+      if (!solution || maxKey <= solution.maxKey) {
+        solution = { maxKey, maxOutDegree, links };
+      }
+    }
+
+    return solution ?? { maxKey: INF, maxOutDegree: INF, links: [] };
+  }
+}
+
+class ConvexHull extends PointSet {
+  triangulation() {
+    const partitions = [];
+    const partition = [];
+    if (this.norm >= 3) {
+      for (let i = 1; i < this.norm - 1; i += 1) {
+        const middlePart = new ConvexHull([this.pointList[0], this.pointList[i], this.pointList.at(-1)]);
+        const rightPart = new ConvexHull(this.pointList.slice(0, i + 1));
+        const leftPart = new ConvexHull(this.pointList.slice(i));
+        if (rightPart.norm < 3) {
+          if (leftPart.norm < 3) {
+            partition.push(middlePart);
+            partitions.push(partition);
+          } else {
+            for (const a of leftPart.triangulation()) {
+              for (const b of middlePart.triangulation()) {
+                partitions.push([...a, ...b, ...partition]);
+              }
+            }
+          }
+        } else if (leftPart.norm < 3) {
+          for (const a of middlePart.triangulation()) {
+            for (const b of rightPart.triangulation()) {
+              partitions.push([...a, ...partition, ...b]);
+            }
+          }
+        } else {
+          for (const a of leftPart.triangulation()) {
+            for (const b of middlePart.triangulation()) {
+              for (const c of rightPart.triangulation()) {
+                partitions.push([...a, ...b, ...partition, ...c]);
+              }
+            }
+          }
+        }
+      }
+    }
+    return partitions;
+  }
+}
+
+class Triangle extends PointSet {
+  static resultMap = new Map();
+
+  constructor(points, custom = false) {
+    super(points);
+    if (custom) {
+      [this.A, this.B, this.C] = points;
+      this.innerPoints = [];
+    } else {
+      this.A = this.convexHull.pointList[0];
+      this.B = this.convexHull.pointList[1];
+      this.C = this.convexHull.pointList[2];
+    }
+  }
+
+  key() {
+    return canonicalTriangleKey(this);
+  }
+
+  addInnerPoints(point) {
+    if (this.cover(point) && !this.pointList.includes(point)) {
+      this.pointList.push(point);
+      this.innerPoints.push(point);
+      this.needUpdate = true;
+    }
+  }
+
+  nextVertex(vertex) {
+    if (vertex === this.A) return this.B;
+    if (vertex === this.B) return this.C;
+    return this.A;
+  }
+
+  previousVertex(vertex) {
+    if (vertex === this.A) return this.C;
+    if (vertex === this.B) return this.A;
+    return this.B;
+  }
+
+  isNeighbour(other) {
+    return [this.A, this.B, this.C].filter((point) => [other.A, other.B, other.C].includes(point)).length === 2;
+  }
+
+  commonEdge(other) {
+    const intersection = [this.A, this.B, this.C].filter((point) => [other.A, other.B, other.C].includes(point));
+    return new Link(intersection[0], intersection[1]);
+  }
+
+  getOuterIndex(link) {
+    if (sameUndirectedLink(link, new Link(this.A, this.B))) return 0;
+    if (sameUndirectedLink(link, new Link(this.B, this.C))) return 1;
+    if (sameUndirectedLink(link, new Link(this.C, this.A))) return 2;
+    return null;
+  }
+
+  divideIntoThreeTriangle(divider) {
+    const abd = new Triangle([this.A, this.B, divider], true);
+    const bcd = new Triangle([this.B, this.C, divider], true);
+    const dca = new Triangle([divider, this.C, this.A], true);
+    return this.divide([abd, bcd, dca]);
+  }
+
+  findBalanceKeySolution({ outerLinksSet = null, depth = 0, initOut = new Map(), initIn = new Map() } = {}) {
+    const normalizedOuterLinksSet = outerLinksSet ?? cartesianProduct([
+      [new Link(this.A, this.B), new Link(this.A, this.B, { reverse: true })],
+      [new Link(this.B, this.C), new Link(this.B, this.C, { reverse: true })],
+      [new Link(this.C, this.A), new Link(this.C, this.A, { reverse: true })]
+    ]);
+
+    let result = null;
+    if (this.norm === 3) {
+      for (const outerLinks of normalizedOuterLinksSet) {
+        const key = new Map([[this.A, 0], [this.B, 0], [this.C, 0]]);
+        for (const link of outerLinks) {
+          addMap(key, link.target, 1);
+        }
+        const tmpResult = baseResult();
+        tmpResult.key = Math.max(...key.values());
+        if (depth === 0) {
+          tmpResult.links = [...outerLinks];
+        }
+        if (!result || tmpResult.key <= result.key) {
+          result = tmpResult;
+        }
+      }
+      return result;
+    }
+
+    for (const outerLinks of normalizedOuterLinksSet) {
+      for (const divider of this.innerPoints) {
+        for (const jetPoint of [this.A, this.B, this.C]) {
+          for (const dBD of [0, 1]) {
+            for (const dCD of [0, 1]) {
+              const { AD, BD, CD } = this.buildDividerLinks(jetPoint, divider, dBD, dCD);
+              const subTriangles = this.divideIntoThreeTriangle(divider);
+              const subResults = [];
+
+              for (let index = 0; index < subTriangles.length; index += 1) {
+                const triangle = subTriangles[index];
+                const cached = Triangle.resultMap.get(triangle.key());
+                if (cached) {
+                  subResults.push(cached);
+                  continue;
+                }
+
+                let tmp;
+                if (index === 0) {
+                  tmp = triangle.findBalanceKeySolution({ outerLinksSet: [[outerLinks[0], BD, AD]], depth: depth + 1, initOut, initIn });
+                } else if (index === 1) {
+                  tmp = triangle.findBalanceKeySolution({ outerLinksSet: [[outerLinks[1], CD, BD]], depth: depth + 1, initOut, initIn });
+                } else {
+                  tmp = triangle.findBalanceKeySolution({ outerLinksSet: [[CD, outerLinks[2], AD]], depth: depth + 1, initOut, initIn });
+                }
+                Triangle.resultMap.set(triangle.key(), tmp);
+                subResults.push(tmp);
+              }
+
+              const tmpResult = this.combineSubResults({ subResults, outerLinks, AD, BD, CD, jetPoint, dBD, dCD, divider, initOut, initIn, depth });
+              const feasibility = testFeasibility([...tmpResult.links, ...outerLinks]);
+              if (!feasibility.ok) {
+                tmpResult.key = INF;
+              } else if (depth === 0) {
+                tmpResult.links = feasibility.links;
+              }
+
+              if (!result || tmpResult.key <= result.key) {
+                result = tmpResult;
+              }
+            }
+          }
+        }
+      }
+    }
+    return result ?? { ...baseResult(), key: INF };
+  }
+
+  buildDividerLinks(jetPoint, divider, dBD, dCD) {
+    if (jetPoint === this.A) {
+      return {
+        AD: new Link(this.A, divider, { jetLink: true, triangle: this }),
+        BD: new Link(this.B, divider, { reverse: 1 - dBD }),
+        CD: new Link(this.C, divider, { reverse: 1 - dCD })
+      };
+    }
+    if (jetPoint === this.B) {
+      return {
+        AD: new Link(this.A, divider, { reverse: 1 - dCD }),
+        BD: new Link(this.B, divider, { jetLink: true, triangle: this }),
+        CD: new Link(this.C, divider, { reverse: 1 - dBD })
+      };
+    }
+    return {
+      AD: new Link(this.A, divider, { reverse: 1 - dBD }),
+      BD: new Link(this.B, divider, { reverse: 1 - dCD }),
+      CD: new Link(this.C, divider, { jetLink: true, triangle: this })
+    };
+  }
+
+  combineSubResults({ subResults, outerLinks, AD, BD, CD, jetPoint, dBD, dCD, divider, initOut, initIn, depth }) {
+    const tmpResult = {
+      links: [...subResults[0].links, ...subResults[1].links, ...subResults[2].links, AD, BD, CD],
+      outDegreeA: subResults[0].outDegreeA + subResults[2].outDegreeC,
+      outDegreeB: subResults[0].outDegreeB + subResults[1].outDegreeA,
+      outDegreeC: subResults[1].outDegreeB + subResults[2].outDegreeB,
+      inDegreeA: subResults[0].inDegreeA + subResults[2].inDegreeC,
+      inDegreeB: subResults[0].inDegreeB + subResults[1].inDegreeA,
+      inDegreeC: subResults[1].inDegreeB + subResults[2].inDegreeB,
+      key: INF
+    };
+
+    if (jetPoint === this.A) {
+      tmpResult.outDegreeA += 1;
+      tmpResult.outDegreeB += dBD;
+      tmpResult.outDegreeC += dCD;
+      tmpResult.inDegreeB += 1 - dBD;
+      tmpResult.inDegreeC += 1 - dCD;
+    } else if (jetPoint === this.B) {
+      tmpResult.outDegreeB += 1;
+      tmpResult.outDegreeC += dBD;
+      tmpResult.outDegreeA += dCD;
+      tmpResult.inDegreeC += 1 - dBD;
+      tmpResult.inDegreeA += 1 - dCD;
+    } else {
+      tmpResult.outDegreeC += 1;
+      tmpResult.outDegreeA += dBD;
+      tmpResult.outDegreeB += dCD;
+      tmpResult.inDegreeA += 1 - dBD;
+      tmpResult.inDegreeB += 1 - dCD;
+    }
+
+    const inDegreeD = 1 + dBD + dCD + subResults[0].inDegreeC + subResults[1].inDegreeC + subResults[2].inDegreeA;
+    if (depth === 0) {
+      tmpResult.inDegreeD = inDegreeD;
+    }
+
+    const labels = new Map([[this.A, 'A'], [this.B, 'B'], [this.C, 'C']]);
+    const actualOut = { A: tmpResult.outDegreeA, B: tmpResult.outDegreeB, C: tmpResult.outDegreeC };
+    const actualIn = { A: tmpResult.inDegreeA, B: tmpResult.inDegreeB, C: tmpResult.inDegreeC };
+
+    for (const link of outerLinks) {
+      actualOut[labels.get(link.origin)] += 1;
+      actualIn[labels.get(link.target)] += 1;
+    }
+    for (const point of [this.A, this.B, this.C]) {
+      const label = labels.get(point);
+      if (initOut.has(point)) {
+        actualOut[label] += initOut.get(point);
+      }
+      if (initIn.has(point)) {
+        actualIn[label] += initIn.get(point);
+      }
+    }
+
+    if (depth === 0) {
+      tmpResult.outDegreeA = actualOut.A;
+      tmpResult.outDegreeB = actualOut.B;
+      tmpResult.outDegreeC = actualOut.C;
+      tmpResult.inDegreeA = actualIn.A;
+      tmpResult.inDegreeB = actualIn.B;
+      tmpResult.inDegreeC = actualIn.C;
+    }
+
+    tmpResult.key = Math.max(...subResults.map((subResult) => subResult.key), ...Object.values(actualIn), inDegreeD);
+    if (Math.max(...Object.values(actualOut)) > 8) {
+      tmpResult.key = INF;
+    }
+    tmpResult.divider = divider;
+    return tmpResult;
+  }
+}
+
+function findUpstreamPlan(portalsInput) {
+  const portals = [...new Map((portalsInput ?? []).map(normalizePortal).map((portal) => [portal.id, portal])).values()]
+    .filter((portal) => portal.id && Number.isFinite(portal.lat) && Number.isFinite(portal.lng))
+    .sort((a, b) => a.lng - b.lng || a.lat - b.lat || a.id.localeCompare(b.id));
+  const points = portals.map((portal) => new UpstreamPoint(portal));
+
+  if (points.length < 3) {
+    return { status: 'empty', portals, reason: 'Select at least 3 portals.', links: [], maxKey: 0, maxOutDegree: 0 };
+  }
+
+  Triangle.resultMap = new Map();
+  const solution = new PointSet(points).findBalanceKeySolution();
+  if (!solution.links.length || !Number.isFinite(solution.maxKey)) {
+    return { status: 'empty', portals, reason: 'Could not produce a feasible upstream multi-field plan.', links: [], maxKey: solution.maxKey, maxOutDegree: solution.maxOutDegree };
+  }
+
+  return {
+    status: 'ok',
+    portals,
+    links: uniqueDirectedLinks(solution.links),
+    maxKey: solution.maxKey,
+    maxOutDegree: solution.maxOutDegree
+  };
+}
+
+function testFeasibility(links) {
+  const jetLinks = links.filter((link) => link.jetLink).sort(compareJetLinks);
+  if (jetLinks.length === 0) {
+    return { ok: true, links };
+  }
+
+  try {
+    return { ok: true, links: drawOtherLinks(jetLinks[0], [...jetLinks], links) };
+  } catch (error) {
+    if (error instanceof RangeError) {
+      return { ok: true, links };
+    }
+    return { ok: false, links: [] };
+  }
+}
+
+function drawOtherLinks(jetLink, jetLinks, links, edges = []) {
+  const A = jetLink.origin;
+  const D = jetLink.target;
+  const B = jetLink.triangle.nextVertex(A);
+  const C = jetLink.triangle.previousVertex(A);
+  const BD = new Link(B, D);
+  const CD = new Link(C, D);
+  const BC = new Link(B, C);
+  const AB = new Link(A, B);
+  const AC = new Link(A, C);
+  const seq = [BD, CD, BC, AB, AC].filter((edge) => !containsUndirected(edges, edge));
+  const canLink = [];
+
+  for (let edge of seq) {
+    const existing = links.find((link) => sameUndirectedLink(edge, link));
+    if (existing) {
+      edge = existing;
+    }
+
+    const vertices = uniquePoints(edges.concat(canLink).flatMap((ele) => [ele.origin, ele.target]));
+    for (const ele of edges.concat(canLink)) {
+      for (const vertex of vertices) {
+        if (containsUndirected(edges.concat(canLink), new Link(ele.origin, vertex))
+          && containsUndirected(edges.concat(canLink), new Link(ele.target, vertex))) {
+          if (new Triangle([ele.origin, ele.target, vertex]).cover(edge.origin)) {
+            throw new Error('Inside an existing field.');
+          }
+        }
+      }
+    }
+
+    const jetIndex = jetLinks.findIndex((link) => sameUndirectedLink(edge, link));
+    if (jetIndex >= 0) {
+      return drawOtherLinks(jetLinks[jetIndex], jetLinks, links, edges.concat(canLink));
+    }
+    canLink.push(edge);
+  }
+
+  removeLink(jetLinks, jetLink);
+  if (jetLinks.length > 0) {
+    return drawOtherLinks(jetLinks[0], jetLinks, links, edges.concat(canLink, [jetLink]));
+  }
+  return edges.concat(canLink, [jetLink]);
+}
+
+function genOuterLinksSet(index, link, triangle) {
+  const sets = [
+    [new Link(triangle.A, triangle.B), new Link(triangle.A, triangle.B, { reverse: true })],
+    [new Link(triangle.B, triangle.C), new Link(triangle.B, triangle.C, { reverse: true })],
+    [new Link(triangle.C, triangle.A), new Link(triangle.C, triangle.A, { reverse: true })]
+  ];
+  sets[index] = [link];
+  return cartesianProduct(sets);
+}
+
+function crossProduct(p0, p1, p2) {
+  return (p1.x - p0.x) * (p2.y - p0.y) - (p2.x - p0.x) * (p1.y - p0.y);
+}
+
+function comparePoints(a, b) {
+  return a.x - b.x || a.y - b.y || a.id.localeCompare(b.id);
+}
+
+function sameUndirectedLink(a, b) {
+  return (a.origin === b.origin && a.target === b.target) || (a.origin === b.target && a.target === b.origin);
+}
+
+function sameDirectedLink(a, b) {
+  return a.origin === b.origin && a.target === b.target;
+}
+
+function containsUndirected(links, target) {
+  return links.some((link) => sameUndirectedLink(link, target));
+}
+
+function removeLink(links, target) {
+  const index = links.findIndex((link) => sameUndirectedLink(link, target));
+  if (index >= 0) {
+    links.splice(index, 1);
+  }
+}
+
+function removePoint(points, target) {
+  const index = points.indexOf(target);
+  if (index >= 0) {
+    points.splice(index, 1);
+  }
+}
+
+function uniquePoints(points) {
+  return [...new Set(points)];
+}
+
+function uniqueLinks(links) {
+  const result = [];
+  for (const link of links) {
+    if (!containsUndirected(result, link)) {
+      result.push(link);
+    }
+  }
+  return result;
+}
+
+function uniqueDirectedLinks(links) {
+  const result = [];
+  for (const link of links) {
+    if (!result.some((existing) => sameDirectedLink(existing, link))) {
+      result.push(link);
+    }
+  }
+  return result;
+}
+
+function cartesianProduct(arrays) {
+  return arrays.reduce((acc, values) => acc.flatMap((prefix) => values.map((value) => [...prefix, value])), [[]]);
+}
+
+function addMap(map, key, value) {
+  map.set(key, (map.get(key) ?? 0) + value);
+}
+
+function baseResult() {
+  return {
+    key: 0,
+    links: [],
+    outDegreeA: 0,
+    outDegreeB: 0,
+    outDegreeC: 0,
+    inDegreeA: 0,
+    inDegreeB: 0,
+    inDegreeC: 0
+  };
+}
+
+function canonicalTriangleKey(triangle) {
+  return [triangle.A.id, triangle.B.id, triangle.C.id].sort().join('|');
+}
+
+function getTriangleMap(map, triangle) {
+  return map.get(triangle);
+}
+
+function compareJetLinks(a, b) {
+  if (a.triangle.cover(b.origin)) return 1;
+  if (b.triangle.cover(a.origin)) return -1;
+  return 0;
+}
+
+
 // src/planner/planner.js
 
 function planMultiField(input) {
-  const portals = [...new Map((input?.portals ?? [])
-    .map(normalizePortal)
-    .filter((portal) => portal.id && Number.isFinite(portal.lat) && Number.isFinite(portal.lng))
-    .map((portal) => [portal.id, portal])).values()]
-    .sort(comparePortals);
-
-  if (portals.length < 3) {
-    return emptyResult(portals, 'Select at least 3 portals.');
+  const upstreamResult = findUpstreamPlan(input?.portals ?? []);
+  const portals = upstreamResult.portals.map(normalizePortal);
+  if (upstreamResult.status !== 'ok') {
+    return emptyResult(portals, upstreamResult.reason);
   }
 
-  const hull = convexHull(portals);
-  if (hull.length < 3) {
-    return emptyResult(portals, 'Selected portals must not be collinear.');
-  }
+  const orderedLinks = orderLinks(upstreamResult.links.map((link) => ({
+    id: `${link.origin.id}->${link.target.id}`,
+    from: link.origin.id,
+    to: link.target.id,
+    fromPortal: link.origin.portal,
+    toPortal: link.target.portal
+  })));
 
-  const anchors = chooseBestAnchorTriangle(hull);
-  const inner = portals
-    .filter((portal) => !anchors.some((anchor) => anchor.id === portal.id))
-    .filter((portal) => pointInTriangle(portal, anchors[0], anchors[1], anchors[2]))
-    .sort((a, b) => triangleArea(anchors[0], anchors[1], a) - triangleArea(anchors[0], anchors[1], b) || comparePortals(a, b));
-
-  const unordered = [
-    makeLink(anchors[0], anchors[1]),
-    makeLink(anchors[1], anchors[2]),
-    makeLink(anchors[2], anchors[0])
-  ];
-
-  for (const portal of inner) {
-    unordered.push(makeLink(anchors[0], portal));
-  }
-
-  const orderedLinks = orderLinks(unordered);
   if (!validateNonCrossingLinks(orderedLinks)) {
-    return emptyResult(portals, 'Could not produce a non-crossing plan for this portal set.');
+    return emptyResult(portals, 'Upstream planner produced a crossing plan for this portal set.');
   }
 
-  const fieldCount = Math.max(1, 1 + inner.length);
+  const fieldCount = Math.max(0, orderedLinks.length - portals.length + 1);
   const plan = {
     status: 'ok',
     portals,
-    anchors,
+    anchors: [],
     orderedLinks,
     fieldCount,
-    linkCount: orderedLinks.length
+    linkCount: orderedLinks.length,
+    maxKey: upstreamResult.maxKey,
+    maxOutDegree: upstreamResult.maxOutDegree
   };
   const score = scorePlan(plan);
   const requiredKeys = summarizeRequiredKeys(portals, orderedLinks);
@@ -258,26 +865,6 @@ function planMultiField(input) {
     score,
     requiredKeys
   };
-}
-
-function chooseBestAnchorTriangle(hull) {
-  let best = [hull[0], hull[1], hull[2]];
-  let bestArea = -Infinity;
-  for (let i = 0; i < hull.length; i += 1) {
-    for (let j = i + 1; j < hull.length; j += 1) {
-      for (let k = j + 1; k < hull.length; k += 1) {
-        const candidate = [hull[i], hull[j], hull[k]];
-        const area = triangleArea(...candidate);
-        const signature = candidate.map((portal) => portal.id).join('|');
-        const bestSignature = best.map((portal) => portal.id).join('|');
-        if (area > bestArea || (area === bestArea && signature < bestSignature)) {
-          best = candidate;
-          bestArea = area;
-        }
-      }
-    }
-  }
-  return best;
 }
 
 function emptyResult(portals, reason) {
